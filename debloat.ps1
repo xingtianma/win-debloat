@@ -57,16 +57,22 @@
         '*McAfee*'
     )
  
-    # ================= HELPERS =================
+    # Helpers
     function Write-Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
     function Write-Ok($msg)   { Write-Host "    $msg" -ForegroundColor Green }
     function Write-Warn($msg) { Write-Host "    $msg" -ForegroundColor Yellow }
  
-    # Runs one section; if it fails, logs the error and moves on to the next section.
+    # List of anything that fails
+    $failures = [System.Collections.Generic.List[string]]::new()
+
+    # Runs one section of code, if fails adds to $failures
     function Invoke-Step($Name, [scriptblock]$Action) {
         Write-Step $Name
         try { & $Action }
-        catch { Write-Warn "Failed: $($_.Exception.Message)" }
+        catch {
+            Write-Warn "Failed: $($_.Exception.Message)"
+            $failures.Add($Name)
+        }
     }
  
     # Creates the registry key if needed, then sets the value.
@@ -75,21 +81,18 @@
         New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
     }
  
-    # ================= ADMIN CHECK =================
     $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         Write-Host 'Please run PowerShell as Administrator, then try again.' -ForegroundColor Red
         return
     }
  
-    # ================= LOGGING =================
     $logDir  = Join-Path $env:ProgramData 'win-debloat'
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     $logFile = Join-Path $logDir ('log-{0:yyyy-MM-dd_HH-mm-ss}.txt' -f (Get-Date))
     Start-Transcript -Path $logFile | Out-Null
  
     try {
-        # ---------- Restore point ----------
         if ($CreateRestorePoint) {
             Invoke-Step 'Creating a System Restore point' {
                 Enable-ComputerRestore -Drive "$env:SystemDrive\"
@@ -98,9 +101,16 @@
                 Checkpoint-Computer -Description 'Before win-debloat' -RestorePointType 'MODIFY_SETTINGS'
                 Write-Ok 'Restore point created.'
             }
+            # The restore point is the safety net; don't make changes without one unless the user agrees
+            if ($failures.Count -gt 0) {
+                $answer = Read-Host '    No restore point was created. Continue anyway? (y/N)'
+                if ($answer -notmatch '^(y|yes)$') {
+                    Write-Host "`nStopped before making any changes. Log saved to $logFile" -ForegroundColor Red
+                    return
+                }
+            }
         }
  
-        # ---------- Bloat apps ----------
         Invoke-Step 'Removing preinstalled apps' {
             $allProvisioned = Get-AppxProvisionedPackage -Online
             foreach ($app in $AppsToRemove) {
@@ -114,11 +124,11 @@
                 }
                 catch {
                     Write-Warn "Could not remove ${app}: $($_.Exception.Message)"
+                    $failures.Add("Remove $app")
                 }
             }
         }
  
-        # ---------- Stop apps coming back ----------
         Invoke-Step 'Stopping Windows from auto-installing suggested apps' {
             $cdm = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
             foreach ($name in 'SilentInstalledAppsEnabled', 'PreInstalledAppsEnabled',
@@ -129,7 +139,6 @@
             Write-Ok 'Done.'
         }
  
-        # ---------- Power plan ----------
         Invoke-Step 'Setting the Ultimate Performance power plan' {
             $line = powercfg /list | Select-String 'Ultimate Performance' | Select-Object -First 1
             if (-not $line) {
@@ -148,7 +157,6 @@
             }
         }
  
-        # ---------- Gaming settings ----------
         Invoke-Step 'Applying gaming settings' {
             Set-Reg 'HKCU:\Software\Microsoft\GameBar' 'AutoGameModeEnabled' 1
             Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2
@@ -159,8 +167,7 @@
                 Write-Ok 'Background game recording off.'
             }
         }
- 
-        # ---------- Telemetry ----------
+
         Invoke-Step 'Reducing telemetry' {
             foreach ($svc in 'DiagTrack', 'dmwappushservice') {
                 if (Get-Service -Name $svc -ErrorAction SilentlyContinue) {
@@ -172,7 +179,14 @@
             Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry' 0
         }
  
-        Write-Host "`nAll done. Log saved to $logFile" -ForegroundColor Green
+        if ($failures.Count -eq 0) {
+            Write-Host "`nAll done. Log saved to $logFile" -ForegroundColor Green
+        }
+        else {
+            Write-Host "`nFinished, but $($failures.Count) item(s) failed:" -ForegroundColor Yellow
+            foreach ($f in $failures) { Write-Warn "- $f" }
+            Write-Host "See the log for details: $logFile" -ForegroundColor Yellow
+        }
         Write-Host 'Restart your PC to apply everything.' -ForegroundColor Green
     }
     finally {
